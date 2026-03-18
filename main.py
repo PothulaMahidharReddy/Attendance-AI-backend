@@ -37,6 +37,7 @@ app.add_middleware(
 MONGO_URL = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "Reports")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "biometricdatas")
+ROSTER_COLLECTION_NAME = os.getenv("ROSTER_COLLECTION_NAME", "roster")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # ✅ Safety check
@@ -50,6 +51,7 @@ try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client[DB_NAME]
     attendance_col = db[COLLECTION_NAME]
+    roster_col = db[ROSTER_COLLECTION_NAME]
     groq_client = Groq(api_key=GROQ_API_KEY)
     logger.info(f"Connected to MongoDB: DB: {DB_NAME}, Collection: {COLLECTION_NAME}")
 except Exception as e:
@@ -76,13 +78,54 @@ def format_duration(minutes: int) -> str:
     if not minutes: return "0h 0m"
     return f"{minutes // 60}h {minutes % 60}m"
 
-def serialize_doc(doc: dict) -> dict:
+def stringify_objectids(obj):
+    from bson import ObjectId
+    if isinstance(obj, dict):
+        return {k: stringify_objectids(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [stringify_objectids(i) for i in obj]
+    elif isinstance(obj, ObjectId):
+        return str(obj)
+    return obj
+
+async def get_roster_mapping(records: list) -> dict:
+    try:
+        if not records: return {}
+        user_ids = list(set([r.get("userId") for r in records if r.get("userId")]))
+        dates = [r.get("date") for r in records if isinstance(r.get("date"), datetime)]
+        
+        if not user_ids or not dates: return {}
+        
+        min_date = min(dates) - timedelta(days=2)
+        max_date = max(dates) + timedelta(days=2)
+        
+        cursor = roster_col.find({
+            "userId": {"$in": user_ids},
+            "rosterDate": {"$gte": min_date, "$lte": max_date}
+        })
+        rosters = await cursor.to_list(length=10000)
+        
+        mapping = {}
+        for ro in rosters:
+            u_id = str(ro.get("userId"))
+            r_date = fmt_date_ist(ro.get("rosterDate"))
+            mapping[f"{u_id}_{r_date}"] = {
+                "shiftStart": ro.get("shiftStart", "—"),
+                "shiftEnd": ro.get("shiftEnd", "—"),
+                "splitSchedules": stringify_objectids(ro.get("splitSchedules", []))
+            }
+        return mapping
+    except Exception as e:
+        logger.error(f"Error fetching rosters for join: {e}")
+        return {}
+
+def serialize_doc(doc: dict, roster_info: dict = None) -> dict:
     login = doc.get("login")
     logout = doc.get("logout")
     date = doc.get("date")
     total_mins = doc.get("totalWorkedMinutes") or doc.get("total_worked_minutes") or doc.get("totalMinutes", 0)
     
-    return {
+    base = {
         "id": str(doc.get("_id", "")),
         "userId": str(doc.get("userId", "")),
         "userName": doc.get("userName") or doc.get("employeeName") or "Unknown",
@@ -100,6 +143,17 @@ def serialize_doc(doc: dict) -> dict:
         "isOvernightShift": doc.get("isOvernightShift", False),
         "autoClosed": doc.get("autoClosed", False),
     }
+
+    if roster_info:
+        base["shiftStart"] = roster_info.get("shiftStart", "—")
+        base["shiftEnd"] = roster_info.get("shiftEnd", "—")
+        base["splitSchedules"] = roster_info.get("splitSchedules", [])
+    else:
+        base["shiftStart"] = "—"
+        base["shiftEnd"] = "—"
+        base["splitSchedules"] = []
+        
+    return base
 
 def ist_to_utc_midnight(date_str: str) -> datetime:
     dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -197,7 +251,14 @@ async def get_reports(type: str, date: str):
         cursor = attendance_col.find(filt).sort("date", -1)
         records = await cursor.to_list(length=10000)
         
-        serialized = [serialize_doc(r) for r in records]
+        roster_map = await get_roster_mapping(records)
+        
+        serialized = []
+        for r in records:
+            u_id = str(r.get("userId"))
+            r_dt = fmt_date_ist(r.get("date"))
+            key = f"{u_id}_{r_dt}"
+            serialized.append(serialize_doc(r, roster_map.get(key)))
         
         return {
             "records": serialized,
@@ -225,11 +286,16 @@ async def get_dashboard_summary(request: dict = Body(...)):
         cursor = attendance_col.find({"date": {"$gte": mid - timedelta(minutes=10), "$lte": mid + timedelta(minutes=10)}})
         records = await cursor.to_list(length=1000)
         
+        roster_map = await get_roster_mapping(records)
+
         present_list, late_list, all_worked = [], [], []
         total_mins = 0
 
         for r in records:
-            s_doc = serialize_doc(r)
+            u_id = str(r.get("userId"))
+            r_dt = fmt_date_ist(r.get("date"))
+            key = f"{u_id}_{r_dt}"
+            s_doc = serialize_doc(r, roster_map.get(key))
             all_worked.append(s_doc)
             
             if r.get("status") == "present":
@@ -280,8 +346,17 @@ async def natural_language_query(request: dict = Body(...)):
         cursor = attendance_col.find(filt).sort(list(meta.get("sort", {"login": -1}).items())).limit(5000)
         data = await cursor.to_list(length=5000)
         
+        roster_map = await get_roster_mapping(data)
+
+        records = []
+        for d in data:
+            u_id = str(d.get("userId"))
+            r_dt = fmt_date_ist(d.get("date"))
+            key = f"{u_id}_{r_dt}"
+            records.append(serialize_doc(d, roster_map.get(key)))
+            
         return {
-            "records": [serialize_doc(d) for d in data],
+            "records": records,
             "count": len(data)
         }
     except Exception as e:
