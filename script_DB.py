@@ -1,13 +1,27 @@
+import os
+from dotenv import load_dotenv
 from pymongo import MongoClient
 import time
 
-# Server MongoDB
-server_client = MongoClient("mongodb://root:mysqlRoot@52.9.12.117:27017/Reports?authSource=admin")
+load_dotenv()
+
+# Use environment variables (set these in Hugging Face Space Secrets)
+SERVER_URI = os.getenv("SERVER_MONGO_URI")
+LOCAL_URI = os.getenv("MONGO_URI")
+
+if not SERVER_URI:
+    # Fallback to hardcoded only for debugging (NOT recommended for public repo)
+    SERVER_URI = "mongodb://root:mysqlRoot@52.9.12.117:27017/Reports?authSource=admin"
+
+if not LOCAL_URI:
+    # Fallback to hardcoded only for debugging (NOT recommended for public repo)
+    LOCAL_URI = "mongodb+srv://mahidarm96_db_user:fNFLR65zr20I09CC@cluster0.72efjak.mongodb.net/"
+
+server_client = MongoClient(SERVER_URI)
 server_db = server_client["Reports"]
 server_collection = server_db["biometricdatas"]
 
-# Local MongoDB Atlas
-local_client = MongoClient("mongodb+srv://mahidarm96_db_user:fNFLR65zr20I09CC@cluster0.72efjak.mongodb.net/")
+local_client = MongoClient(LOCAL_URI)
 local_db = local_client["Reports"]
 local_collection = local_db["biometricdatas"]
 
