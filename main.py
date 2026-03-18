@@ -174,6 +174,41 @@ async def startup_event():
 
 # ── API ──────────────────────────────────────────────────────────
 
+@app.get("/reports")
+async def get_reports(type: str, date: str):
+    try:
+        mid = ist_to_utc_midnight(date)
+        
+        if type == "daily":
+            start_date = mid
+            end_date = mid + timedelta(days=1)
+        elif type == "weekly":
+            end_date = mid + timedelta(days=1)
+            start_date = mid - timedelta(days=6)
+        elif type == "monthly":
+            end_date = mid + timedelta(days=1)
+            start_date = mid - timedelta(days=29)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid report type")
+
+        # Range filter for the selected period
+        filt = {"date": {"$gte": start_date, "$lt": end_date}}
+        
+        cursor = attendance_col.find(filt).sort("date", -1)
+        records = await cursor.to_list(length=10000)
+        
+        serialized = [serialize_doc(r) for r in records]
+        
+        return {
+            "records": serialized,
+            "count": len(serialized),
+            "period": type,
+            "referenceDate": date
+        }
+    except Exception as e:
+        logger.error(f"Report generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/status")
 async def get_status():
     try:
